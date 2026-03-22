@@ -1,0 +1,20 @@
+# YOLOv8 学习项目依赖
+# 安装方式: pip install -r requirements.txt
+
+# 核心框架
+ultralytics>=8.0.0          # YOLOv8 官方库（包含模型定义、训练、推理全套功能）
+
+# 深度学习引擎（已通过 conda 或 pip 单独安装 GPU 版本）
+# torch>=2.0.0
+# torchvision>=0.15.0
+# torchaudio>=2.0.0
+
+# 以下依赖由 ultralytics 自动安装，列出便于理解各自作用：
+# opencv-python>=4.6.0      # 图像/视频读写与处理（类比 Java 的 BufferedImage）
+# numpy>=1.23.0             # 数值计算基础库（类比 Java 的数组，但功能强大得多）
+# matplotlib>=3.3.0         # 绘图库，用于可视化检测结果和训练曲线
+# pillow>=7.1.2             # 图像处理库（类比 Java 的 ImageIO）
+# pyyaml>=5.3.1             # YAML 配置文件解析（类比 Java 的 SnakeYAML）
+# requests>=2.23.0          # HTTP 请求库（类比 Java 的 HttpClient）
+# scipy>=1.4.1              # 科学计算库
+# psutil>=5.8.0             # 系统资源监控
