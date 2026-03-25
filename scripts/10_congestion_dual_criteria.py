@@ -152,6 +152,21 @@ SHARPEN_STRENGTH = 0.3
 ENABLE_DEHAZE = False       # 默认关闭，雨雾天气时可开启
 DEHAZE_STRENGTH = 0.7       # 去雾强度 0~1（越大去雾越强，但可能过曝）
 
+# 【改进 ⑥】夜间增强模式
+# 核心问题: 夜间画面整体偏暗，YOLO 无法提取有效特征，检测率骤降
+# 解决思路:
+#   1. 自动判断是否为夜间（基于画面平均亮度）
+#   2. 夜间自动开启 Gamma 校正 + 增强版 CLAHE + 降低置信度阈值
+#   3. 可选降噪（夜间传感器噪点多，但会牺牲帧率）
+ENABLE_NIGHT_MODE = True            # 夜间增强总开关
+NIGHT_AUTO_DETECT = True            # True=自动检测白天/黑夜; False=手动
+NIGHT_BRIGHTNESS_THRESHOLD = 60     # 画面平均亮度低于此值判定为夜间 (0~255)
+NIGHT_GAMMA = 0.4                   # Gamma 校正值 (<1 提亮暗部, 0.3~0.5 适合夜间)
+NIGHT_CLAHE_CLIP_LIMIT = 4.0        # 夜间 CLAHE 对比度限制（比白天更强）
+NIGHT_CONF_REDUCTION = 0.10         # 夜间自动降低置信度阈值的幅度
+NIGHT_DENOISE = False               # 夜间降噪（fastNlMeans，有效但慢，酌情开启）
+NIGHT_DENOISE_STRENGTH = 10         # 降噪强度 (3~15, 越大越平滑但丢细节)
+
 # ---- 显示窗口 ----
 DISPLAY_WIDTH = 1280
 CHINESE_FONT_PATH = "C:/Windows/Fonts/msyh.ttc"
@@ -220,13 +235,80 @@ def dehaze(frame, strength=0.7):
     return result
 
 
-def preprocess_frame(frame):
-    """帧预处理管道: 去雾 → CLAHE → 锐化"""
+def detect_night(frame):
+    """
+    判断当前帧是否为夜间场景。
+    方法: 将图像转为灰度图，计算平均亮度。
+    低于阈值则判定为夜间。
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(gray)
+    return mean_brightness < NIGHT_BRIGHTNESS_THRESHOLD, mean_brightness
+
+
+def gamma_correction(frame, gamma=0.4):
+    """
+    Gamma 校正 — 夜间增强的核心手段。
+
+    原理: 输出 = 输入^gamma
+    gamma < 1 → 暗部被大幅提亮，亮部变化小（正是夜间需要的效果）
+    gamma = 0.4 时，亮度 50/255 的像素会被拉到 ~130/255
+
+    为什么比简单调亮度好？
+    - 调亮度: 所有像素加同一个值，车灯等高亮区会过曝
+    - Gamma: 非线性映射，暗部提升多、亮部提升少，不容易过曝
+    """
+    # 构建 Gamma 查找表 (LUT)，256 个值只需计算一次
+    inv_gamma = 1.0 / max(gamma, 0.01)
+    table = np.array([
+        np.clip(((i / 255.0) ** inv_gamma) * 255, 0, 255)
+        for i in range(256)
+    ]).astype("uint8")
+    return cv2.LUT(frame, table)
+
+
+def preprocess_frame(frame, is_night=False):
+    """
+    帧预处理管道:
+        白天: 去雾(可选) → CLAHE → 锐化
+        夜间: Gamma校正 → 降噪(可选) → 增强CLAHE → 锐化
+    """
     if not ENABLE_PREPROCESS:
         return frame
 
     result = frame
 
+    # ---- 夜间增强 ----
+    if is_night and ENABLE_NIGHT_MODE:
+        # 1. Gamma 校正 — 把暗部拉亮（最关键的一步）
+        result = gamma_correction(result, NIGHT_GAMMA)
+
+        # 2. 降噪（夜间传感器噪点多，降噪后特征更清晰）
+        if NIGHT_DENOISE:
+            result = cv2.fastNlMeansDenoisingColored(
+                result, None,
+                h=NIGHT_DENOISE_STRENGTH,
+                hForColorComponents=NIGHT_DENOISE_STRENGTH,
+                templateWindowSize=7,
+                searchWindowSize=21)
+
+        # 3. 增强版 CLAHE（clipLimit 比白天更高，拉开对比度）
+        lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(
+            clipLimit=NIGHT_CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_GRID_SIZE)
+        l = clahe.apply(l)
+        result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+        # 4. 锐化
+        if ENABLE_SHARPEN:
+            blurred = cv2.GaussianBlur(result, (0, 0), 3)
+            result = cv2.addWeighted(
+                result, 1.0 + SHARPEN_STRENGTH, blurred,
+                -SHARPEN_STRENGTH, 0)
+        return result
+
+    # ---- 白天正常流程 ----
     # 去雾（适用于雨天/雾天场景）
     if ENABLE_DEHAZE:
         result = dehaze(result, DEHAZE_STRENGTH)
@@ -427,7 +509,8 @@ def put_chinese_text(img, text, pos, color=(255, 255, 255), font_size=20):
 def draw_overlay(frame, tracked_vehicles, track_history,
                  avg_speed, smoothed_speed, smoothed_density,
                  speed_level, density_level, fused_level,
-                 congestion_duration, vehicle_count, fps):
+                 congestion_duration, vehicle_count, fps,
+                 is_night=False, brightness=128.0):
     """绘制增强版信息面板"""
 
     fused_color = LEVEL_COLORS[fused_level]
@@ -436,7 +519,6 @@ def draw_overlay(frame, tracked_vehicles, track_history,
         x1, y1, x2, y2 = v["bbox"]
         tid = v["track_id"]
         spd = v["speed"]
-        raw = v.get("raw_speed", spd)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
 
@@ -454,7 +536,7 @@ def draw_overlay(frame, tracked_vehicles, track_history,
             cv2.polylines(frame, [points], False, (0, 255, 255), 2)
 
     # 信息面板
-    panel_h = 310
+    panel_h = 340
     panel = frame.copy()
     cv2.rectangle(panel, (0, 0), (440, panel_h), (0, 0, 0), -1)
     cv2.addWeighted(panel, 0.7, frame, 0.3, 0, frame)
@@ -468,6 +550,7 @@ def draw_overlay(frame, tracked_vehicles, track_history,
     _pc = ENABLE_PERSPECTIVE_COMP
     _cal = CALIBRATION_MATRIX is not None
     speed_unit = "km/h" if _cal else ("归一化" if _pc else "px/s")
+    night_text = f"夜间模式 (亮度:{brightness:.0f})" if is_night else f"白天模式 (亮度:{brightness:.0f})"
 
     lines = [
         (f"【融合判定】{fused_level}", fused_color),
@@ -479,6 +562,7 @@ def draw_overlay(frame, tracked_vehicles, track_history,
         (f"平滑车速: {smoothed_speed:.3f} {speed_unit}", (255, 255, 255)),
         (f"平滑密度: {smoothed_density:.3f}", (255, 255, 255)),
         (f"FPS: {fps:.1f}", (255, 255, 255)),
+        (f"光照: {night_text}", (100, 200, 255) if is_night else (180, 180, 180)),
         (f"模型: YOLO26n | 去雾: {'ON' if ENABLE_DEHAZE else 'OFF'}",
          (180, 180, 180)),
     ]
@@ -532,6 +616,7 @@ def main():
     print(f"  密度阈值: {DENSITY_THRESHOLDS}")
     print(f"  密度指标: {DENSITY_METRIC}")
     print(f"  去雾增强: {'ON' if ENABLE_DEHAZE else 'OFF'}")
+    print(f"  夜间增强: {'AUTO' if NIGHT_AUTO_DETECT else ('ON' if ENABLE_NIGHT_MODE else 'OFF')}")
     print(f"  相机标定: {'ON (真实 km/h)' if CALIBRATION_MATRIX is not None else 'OFF (透视补偿)'}")
     print("=" * 60)
 
@@ -566,13 +651,26 @@ def main():
 
         t0 = time.time()
 
+        # 【改进 ⑥】夜间自动检测 + 动态置信度调整
+        is_night = False
+        brightness = 128.0
+        if ENABLE_NIGHT_MODE and NIGHT_AUTO_DETECT:
+            is_night, brightness = detect_night(frame)
+        elif ENABLE_NIGHT_MODE and not NIGHT_AUTO_DETECT:
+            is_night = True  # 手动强制夜间模式
+
+        # 夜间自动降低置信度阈值（让暗处车辆也能被检出）
+        cur_conf = CONFIDENCE_THRESHOLD
+        if is_night:
+            cur_conf = max(0.10, CONFIDENCE_THRESHOLD - NIGHT_CONF_REDUCTION)
+
         # 预处理
-        processed = preprocess_frame(frame)
+        processed = preprocess_frame(frame, is_night=is_night)
 
         # YOLO26 跟踪
         results = model.track(
             source=processed,
-            conf=CONFIDENCE_THRESHOLD,
+            conf=cur_conf,
             iou=IOU_THRESHOLD,
             imgsz=1280,
             classes=VEHICLE_CLASS_IDS,
@@ -654,7 +752,8 @@ def main():
             processed, tracked_vehicles, track_history,
             avg_speed, smoothed_speed, smoothed_density,
             speed_level, density_level, fused_level,
-            congestion_duration, len(tracked_vehicles), fps)
+            congestion_duration, len(tracked_vehicles), fps,
+            is_night=is_night, brightness=brightness)
 
         if DISPLAY_WIDTH and vis.shape[1] != DISPLAY_WIDTH:
             scale = DISPLAY_WIDTH / vis.shape[1]
@@ -670,6 +769,7 @@ def main():
                 f"密度: {smoothed_density:.3f} → {density_level} | "
                 f"融合: {fused_level} | "
                 f"拥堵时长: {congestion_duration:.0f}s | "
+                f"{'[夜]' if is_night else '[昼]'} 亮度:{brightness:.0f} | "
                 f"FPS: {fps:.1f}"
             )
 

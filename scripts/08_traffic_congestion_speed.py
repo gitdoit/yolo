@@ -97,6 +97,19 @@ CLAHE_GRID_SIZE = (8, 8)        # 分块大小
 ENABLE_SHARPEN = True           # 锐化（改善模糊/压缩伪影，提升边缘清晰度）
 SHARPEN_STRENGTH = 0.3          # 锐化强度（0~1，0.3 适中，太大会放大噪点）
 
+# ---- 夜间增强模式 ----
+# 解决夜间模型检测率下降的问题:
+#   1. 自动判断白天/黑夜（基于画面平均亮度）
+#   2. 夜间自动开启 Gamma 校正 + 增强 CLAHE + 降低置信度阈值
+ENABLE_NIGHT_MODE = True            # 夜间增强总开关
+NIGHT_AUTO_DETECT = True            # True=自动检测; False=手动强制夜间模式
+NIGHT_BRIGHTNESS_THRESHOLD = 60     # 平均亮度低于此值判定为夜间 (0~255)
+NIGHT_GAMMA = 0.4                   # Gamma 校正值 (<1 提亮暗部)
+NIGHT_CLAHE_CLIP_LIMIT = 4.0        # 夜间 CLAHE 对比度限制
+NIGHT_CONF_REDUCTION = 0.10         # 夜间降低置信度阈值的幅度
+NIGHT_DENOISE = False               # 夜间降噪（fastNlMeans，有效但慢）
+NIGHT_DENOISE_STRENGTH = 10         # 降噪强度
+
 # ---- 显示窗口 ----
 # 显示宽度（像素），高度自动按比例缩放。设为 None 则使用原始分辨率
 DISPLAY_WIDTH = 1280
@@ -128,16 +141,52 @@ def open_stream(url):
 # 帧预处理
 # ============================================================================
 
-def preprocess_frame(frame):
+def preprocess_frame(frame, is_night=False):
     """
     对输入帧做预处理以提升检测精度。
-    1. CLAHE：自适应直方图均衡，解决光照不均/逆光/阴影问题
-    2. 锐化：增强边缘，改善远处车辆的辨识度
+    白天: CLAHE + 锐化
+    夜间: Gamma校正 + 降噪(可选) + 增强CLAHE + 锐化
     """
     if not ENABLE_PREPROCESS:
         return frame
 
     result = frame
+
+    # ---- 夜间增强 ----
+    if is_night and ENABLE_NIGHT_MODE:
+        # Gamma 校正 — 把暗部拉亮
+        inv_gamma = 1.0 / max(NIGHT_GAMMA, 0.01)
+        table = np.array([
+            np.clip(((i / 255.0) ** inv_gamma) * 255, 0, 255)
+            for i in range(256)
+        ]).astype("uint8")
+        result = cv2.LUT(result, table)
+
+        # 降噪
+        if NIGHT_DENOISE:
+            result = cv2.fastNlMeansDenoisingColored(
+                result, None,
+                h=NIGHT_DENOISE_STRENGTH,
+                hForColorComponents=NIGHT_DENOISE_STRENGTH,
+                templateWindowSize=7,
+                searchWindowSize=21)
+
+        # 增强CLAHE
+        lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(
+            clipLimit=NIGHT_CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_GRID_SIZE)
+        l = clahe.apply(l)
+        result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+        if ENABLE_SHARPEN:
+            blurred = cv2.GaussianBlur(result, (0, 0), 3)
+            result = cv2.addWeighted(
+                result, 1.0 + SHARPEN_STRENGTH, blurred,
+                -SHARPEN_STRENGTH, 0)
+        return result
+
+    # ---- 白天正常流程 ----
 
     # CLAHE — 在 LAB 色彩空间的 L 通道做均衡，不影响颜色
     if ENABLE_CLAHE:
@@ -360,13 +409,25 @@ def main():
 
         t0 = time.time()
 
+        # 夜间自动检测 + 动态置信度调整
+        is_night = False
+        if ENABLE_NIGHT_MODE and NIGHT_AUTO_DETECT:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            is_night = np.mean(gray) < NIGHT_BRIGHTNESS_THRESHOLD
+        elif ENABLE_NIGHT_MODE and not NIGHT_AUTO_DETECT:
+            is_night = True
+
+        cur_conf = CONFIDENCE_THRESHOLD
+        if is_night:
+            cur_conf = max(0.10, CONFIDENCE_THRESHOLD - NIGHT_CONF_REDUCTION)
+
         # 预处理
-        processed = preprocess_frame(frame)
+        processed = preprocess_frame(frame, is_night=is_night)
 
         # YOLO26 跟踪（persist=True 保持跨帧 ID）
         results = model.track(
             source=processed,
-            conf=CONFIDENCE_THRESHOLD,
+            conf=cur_conf,
             iou=IOU_THRESHOLD,
             imgsz=1280,
             classes=VEHICLE_CLASS_IDS,
