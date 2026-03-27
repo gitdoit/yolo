@@ -27,7 +27,7 @@ from ultralytics import solutions
 # ============================================================================
 
 PROJECT_ROOT = Path(__file__).parent.parent
-MODEL_PATH = PROJECT_ROOT / "models" / "yolo26n.pt"
+MODEL_PATH = PROJECT_ROOT / "models" / "yolov8n-visdrone.pt"  # 内置 SpeedEstimator 模型（已包含在 ultralytics 包中）
 
 # 视频流地址（与 08 脚本保持一致）
 STREAM_URL = (

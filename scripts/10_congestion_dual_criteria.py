@@ -47,7 +47,7 @@ from ultralytics import YOLO
 # ============================================================================
 
 PROJECT_ROOT = Path(__file__).parent.parent
-MODEL_PATH = PROJECT_ROOT / "models" / "yolo26n.pt"
+MODEL_PATH = PROJECT_ROOT / "models" / "yolov8n-visdrone.pt"
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "congestion_dual"
 
 # ---- 视频流地址 ----
